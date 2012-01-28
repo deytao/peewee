@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+import warnings
 
 try:
     import sqlite3
@@ -49,6 +50,11 @@ if sqlite3:
     sqlite3.register_adapter(decimal.Decimal, lambda v: str(v))
     sqlite3.register_converter('decimal', lambda v: decimal.Decimal(v))
 
+if psycopg2:
+    import psycopg2.extensions
+    psycopg2.extensions.register_type(psycopg2.extensions.UNICODE)
+    psycopg2.extensions.register_type(psycopg2.extensions.UNICODEARRAY)
+
 
 DATABASE_NAME = os.environ.get('PEEWEE_DATABASE', 'peewee.db')
 logger = logging.getLogger('peewee.logger')
@@ -72,12 +78,16 @@ class BaseAdapter(object):
     operations = {'eq': '= %s'}
     interpolation = '%s'
     sequence_support = False
+    reserved_tables = []
+    quote_char = '"'
     
     def get_field_types(self):
         field_types = {
             'integer': 'INTEGER',
+            'bigint': 'INTEGER',
             'float': 'REAL',
             'decimal': 'DECIMAL',
+            'double': 'REAL',
             'string': 'VARCHAR',
             'text': 'TEXT',
             'datetime': 'DATETIME',
@@ -85,6 +95,7 @@ class BaseAdapter(object):
             'primary_key_with_sequence': 'INTEGER',
             'foreign_key': 'INTEGER',
             'boolean': 'SMALLINT',
+            'blob': 'BLOB',
         }
         field_types.update(self.get_field_overrides())
         return field_types
@@ -120,18 +131,20 @@ class BaseAdapter(object):
 class SqliteAdapter(BaseAdapter):
     # note the sqlite library uses a non-standard interpolation string
     operations = {
-        'lt': '< ?',
-        'lte': '<= ?',
-        'gt': '> ?',
-        'gte': '>= ?',
-        'eq': '= ?',
-        'ne': '!= ?', # watch yourself with this one
+        'lt': '< %s',
+        'lte': '<= %s',
+        'gt': '> %s',
+        'gte': '>= %s',
+        'eq': '= %s',
+        'ne': '!= %s', # watch yourself with this one
         'in': 'IN (%s)', # special-case to list q-marks
-        'is': 'IS ?',
-        'icontains': "LIKE ? ESCAPE '\\'", # surround param with %'s
-        'contains': "GLOB ?", # surround param with *'s
-        'istartswith': "LIKE ? ESCAPE '\\'",
-        'startswith': "GLOB ?",
+        'is': 'IS %s',
+        'isnull': 'IS NULL',
+        'between': 'BETWEEN %s AND %s',
+        'icontains': "LIKE %s ESCAPE '\\'", # surround param with %'s
+        'contains': "GLOB %s", # surround param with *'s
+        'istartswith': "LIKE %s ESCAPE '\\'",
+        'startswith': "GLOB %s",
     }
     interpolation = '?'
     
@@ -162,13 +175,16 @@ class PostgresqlAdapter(BaseAdapter):
         'ne': '!= %s', # watch yourself with this one
         'in': 'IN (%s)', # special-case to list q-marks
         'is': 'IS %s',
+        'isnull': 'IS NULL',
+        'between': 'BETWEEN %s AND %s',
         'icontains': 'ILIKE %s', # surround param with %'s
         'contains': 'LIKE %s', # surround param with *'s
         'istartswith': 'ILIKE %s',
         'startswith': 'LIKE %s',
     }
+    reserved_tables = ['user']
     sequence_support = True
-        
+
     def connect(self, database, **kwargs):
         if not psycopg2:
             raise ImproperlyConfigured('psycopg2 must be installed on the system')
@@ -180,7 +196,10 @@ class PostgresqlAdapter(BaseAdapter):
             'primary_key_with_sequence': 'INTEGER',
             'datetime': 'TIMESTAMP',
             'decimal': 'NUMERIC',
+            'double': 'DOUBLE PRECISION',
+            'bigint': 'BIGINT',
             'boolean': 'BOOLEAN',
+            'blob': 'BYTEA',
         }
     
     def last_insert_id(self, cursor, model):
@@ -203,22 +222,32 @@ class MySQLAdapter(BaseAdapter):
         'ne': '!= %s', # watch yourself with this one
         'in': 'IN (%s)', # special-case to list q-marks
         'is': 'IS %s',
+        'isnull': 'IS NULL',
+        'between': 'BETWEEN %s AND %s',
         'icontains': 'LIKE %s', # surround param with %'s
         'contains': 'LIKE BINARY %s', # surround param with *'s
         'istartswith': 'LIKE %s',
         'startswith': 'LIKE BINARY %s',
     }
+    quote_char = '`'
 
     def connect(self, database, **kwargs):
         if not mysql:
             raise ImproperlyConfigured('MySQLdb must be installed on the system')
-        return mysql.connect(db=database, **kwargs)
+        conn_kwargs = {
+            'charset': 'utf8',
+            'use_unicode': True,
+        }
+        conn_kwargs.update(kwargs)
+        return mysql.connect(db=database, **conn_kwargs)
 
     def get_field_overrides(self):
         return {
             'primary_key': 'integer AUTO_INCREMENT',
             'boolean': 'bool',
             'float': 'float',
+            'double': 'double precision',
+            'bigint': 'bigint',
             'text': 'longtext',
             'decimal': 'numeric',
         }
@@ -313,6 +342,9 @@ class Database(object):
     
     def rows_affected(self, cursor):
         return self.adapter.rows_affected(cursor)
+
+    def quote_name(self, name):
+        return ''.join((self.adapter.quote_char, name, self.adapter.quote_char))
     
     def column_for_field(self, field):
         return self.column_for_field_type(field.get_db_field())
@@ -324,7 +356,10 @@ class Database(object):
             raise AttributeError('Unknown field type: "%s", valid types are: %s' % \
                 db_field_type, ', '.join(self.adapter.get_field_types().keys())
             )
-    
+
+    def field_sql(self, field):
+        return '%s %s' % (self.quote_name(field.name), field.render_field_template())
+
     def create_table(self, model_class, safe=False):
         if model_class._meta.pk_sequence and self.adapter.sequence_support:
             if not self.sequence_exists(model_class._meta.pk_sequence):
@@ -333,14 +368,18 @@ class Database(object):
         columns = []
 
         for field in model_class._meta.get_fields():
-            columns.append(field.to_sql())
+            columns.append(self.field_sql(field))
 
-        query = framing % (model_class._meta.db_table, ', '.join(columns))
+        table = self.quote_name(model_class._meta.db_table)
+        query = framing % (table, ', '.join(columns))
         
         self.execute(query)
     
     def create_index(self, model_class, field_name, unique=False):
-        framing = 'CREATE %(unique)s INDEX %(model)s_%(field)s ON %(model)s(%(field)s);'
+        framing = 'CREATE %(unique)s INDEX %(index)s ON %(table)s(%(field)s);'
+
+        db_table = model_class._meta.db_table
+        index_name = self.quote_name('%s_%s' % (db_table, field_name))
         
         if field_name not in model_class._meta.fields:
             raise AttributeError(
@@ -351,23 +390,49 @@ class Database(object):
         
         query = framing % {
             'unique': unique_expr,
-            'model': model_class._meta.db_table,
-            'field': field_name
+            'index': index_name,
+            'table': self.quote_name(db_table),
+            'field': self.quote_name(field_name),
         }
         
         self.execute(query)
+
+    def create_foreign_key(self, model_class, field):
+        return self.create_index(model_class, field.name, field.unique)
     
     def drop_table(self, model_class, fail_silently=False):
         framing = fail_silently and 'DROP TABLE IF EXISTS %s;' or 'DROP TABLE %s;'
-        self.execute(framing % model_class._meta.db_table)
+        self.execute(framing % self.quote_name(model_class._meta.db_table))
+    
+    def add_column_sql(self, model_class, field_name):
+        field = model_class._meta.fields[field_name]
+        return 'ALTER TABLE %s ADD COLUMN %s' % (
+            self.quote_name(model_class._meta.db_table),
+            self.field_sql(field),
+        )
+    
+    def rename_column_sql(self, model_class, field_name, new_name):
+        # this assumes that the field on the model points to the *old* fieldname
+        field = model_class._meta.fields[field_name]
+        return 'ALTER TABLE %s RENAME COLUMN %s TO %s' % (
+            self.quote_name(model_class._meta.db_table),
+            self.quote_name(field_name),
+            self.quote_name(new_name),
+        )
+    
+    def drop_column_sql(self, model_class, field_name):
+        return 'ALTER TABLE %s DROP COLUMN %s' % (
+            self.quote_name(model_class._meta.db_table),
+            self.quote_name(field_name),
+        )
     
     @require_sequence_support
     def create_sequence(self, sequence_name):
-        return self.execute('CREATE SEQUENCE %s;' % sequence_name)
+        return self.execute('CREATE SEQUENCE %s;' % self.quote_name(sequence_name))
     
     @require_sequence_support
     def drop_sequence(self, sequence_name):
-        return self.execute('DROP SEQUENCE %s;' % sequence_name)
+        return self.execute('DROP SEQUENCE %s;' % self.quote_name(sequence_name))
     
     def get_indexes_for_table(self, table):
         raise NotImplementedError
@@ -384,13 +449,19 @@ class SqliteDatabase(Database):
         super(SqliteDatabase, self).__init__(SqliteAdapter(), database, **connect_kwargs)
     
     def get_indexes_for_table(self, table):
-        res = self.execute('PRAGMA index_list(%s);' % table)
+        res = self.execute('PRAGMA index_list(%s);' % self.quote_name(table))
         rows = sorted([(r[1], r[2] == 1) for r in res.fetchall()])
         return rows
     
     def get_tables(self):
         res = self.execute('select name from sqlite_master where type="table" order by name')
         return [r[0] for r in res.fetchall()]
+    
+    def drop_column_sql(self, model_class, field_name):
+        raise NotImplementedError('Sqlite3 does not have direct support for dropping columns')
+    
+    def rename_column_sql(self, model_class, field_name, new_name):
+        raise NotImplementedError('Sqlite3 does not have direct support for renaming columns')
 
 
 class PostgresqlDatabase(Database):
@@ -430,8 +501,46 @@ class MySQLDatabase(Database):
     def __init__(self, database, **connect_kwargs):
         super(MySQLDatabase, self).__init__(MySQLAdapter(), database, **connect_kwargs)
     
+    def create_foreign_key(self, model_class, field):
+        framing = """ 
+            ALTER TABLE %(table)s ADD CONSTRAINT %(constraint)s
+            FOREIGN KEY (%(field)s) REFERENCES %(to)s(%(to_field)s)%(cascade)s;
+        """
+        db_table = model_class._meta.db_table
+        constraint = 'fk_%s_%s_%s' % (
+            db_table,
+            field.to._meta.db_table,
+            field.name,
+        )
+
+        if field.name not in model_class._meta.fields:
+            raise AttributeError(
+                'Field %s not on model %s' % (field_name, model_class)
+            )
+ 
+        query = framing % {
+            'table': self.quote_name(db_table),
+            'constraint': self.quote_name(constraint),
+            'field': self.quote_name(field.name),
+            'to': self.quote_name(field.to._meta.db_table),
+            'to_field': self.quote_name(field.to._meta.pk_name),
+            'cascade': ' ON DELETE CASCADE' if field.cascade else '',
+        }
+ 
+        self.execute(query)
+        return super(MySQLDatabase, self).create_foreign_key(model_class, field)
+    
+    def rename_column_sql(self, model_class, field_name, new_name):
+        field = model_class._meta.fields[field_name]
+        return 'ALTER TABLE %s CHANGE COLUMN %s %s %s' % (
+            self.quote_name(model_class._meta.db_table),
+            self.quote_name(field_name),
+            self.quote_name(new_name),
+            field.render_field_template(),
+        )
+    
     def get_indexes_for_table(self, table):
-        res = self.execute('SHOW INDEXES IN %s;' % table)
+        res = self.execute('SHOW INDEXES IN %s;' % self.quote_name(table))
         rows = sorted([(r[2], r[1] == 0) for r in res.fetchall()])
         return rows
     
@@ -447,42 +556,138 @@ class QueryResultWrapper(object):
     - converts rows from the database into model instances
     - ensures that multiple iterations do not result in multiple queries
     """
-    def __init__(self, model, cursor):
+    def __init__(self, model, cursor, meta=None):
         self.model = model
         self.cursor = cursor
+        self.query_meta = meta or {}
+        self.column_meta = self.query_meta.get('columns')
+        self.join_meta = self.query_meta.get('graph')
+        
+        self.__ct = 0
+        self.__idx = 0
+        
         self._result_cache = []
         self._populated = False
     
-    def model_from_rowset(self, model_class, row_dict):
+    def model_from_rowset(self, model_class, attr_dict):
         instance = model_class()
-        for attr, value in row_dict.iteritems():
+        for attr, value in attr_dict.iteritems():
             if attr in instance._meta.fields:
                 field = instance._meta.fields[attr]
                 setattr(instance, attr, field.python_value(value))
             else:
                 setattr(instance, attr, value)
-        return instance    
+        return instance
     
-    def _row_to_dict(self, row, result_cursor):
-        return dict((result_cursor.description[i][0], value)
+    def _row_to_dict(self, row):
+        return dict((self.cursor.description[i][0], value)
             for i, value in enumerate(row))
     
+    def construct_instance(self, row):
+        if not self.column_meta:
+            # use attribute names pulled from the result cursor description,
+            # and do not attempt to follow joined models
+            row_dict = self._row_to_dict(row)
+            return self.model_from_rowset(self.model, row_dict)
+        else:
+            # we have columns, models, and a graph of joins to reconstruct
+            collected_models = {}
+            for i, (model, col) in enumerate(self.column_meta):
+                value = row[i]
+                
+                if isinstance(col, tuple):
+                    if len(col) == 3:
+                        model = self.model # special-case aggregates
+                        field_name = attr = col[2]
+                    else:
+                        field_name, attr = col
+                else:
+                    field_name = attr = col
+                
+                if model not in collected_models:
+                    collected_models[model] = model()
+                
+                instance = collected_models[model]
+                
+                if field_name in instance._meta.fields:
+                    field = instance._meta.fields[attr]
+                    setattr(instance, attr, field.python_value(value))
+                else:
+                    setattr(instance, attr, value)
+            
+            return self.follow_joins(self.join_meta, collected_models, self.model)
+    
+    def follow_joins(self, joins, collected_models, current):
+        inst = collected_models[current]
+        
+        if current not in joins:
+            return inst
+    
+        for joined_model, _, _ in joins[current]:
+            if joined_model in collected_models:
+                joined_inst = self.follow_joins(joins, collected_models, joined_model)
+                fk_field = current._meta.get_related_field_for_model(joined_model)
+                
+                if not fk_field:
+                    continue
+                
+                if not joined_inst.get_pk():
+                    joined_inst.set_pk(getattr(inst, fk_field.name))
+                
+                setattr(inst, fk_field.descriptor, joined_inst)
+                setattr(inst, fk_field.name, joined_inst.get_pk())
+        
+        return inst
+    
     def __iter__(self):
+        self.__idx = 0
+
         if not self._populated:
             return self
         else:
             return iter(self._result_cache)
     
-    def next(self):
+    def first(self):
+        try:
+            self.__idx = 0 # move to beginning of the list
+            inst = self.next()
+        except StopIteration:
+            inst = None
+        
+        self.__idx = 0
+        return inst
+
+    def fill_cache(self):
+        if not self._populated:
+            idx = self.__idx
+            self.__idx = self.__ct
+            for x in self:
+                pass
+            self.__idx = idx
+    
+    def iterate(self):
         row = self.cursor.fetchone()
         if row:
-            row_dict = self._row_to_dict(row, self.cursor)
-            instance = self.model_from_rowset(self.model, row_dict)
-            self._result_cache.append(instance)
-            return instance
+            return self.construct_instance(row)
         else:
             self._populated = True
             raise StopIteration
+    
+    def iterator(self):
+        while 1:
+            yield self.iterate()
+    
+    def next(self):
+        if self.__idx < self.__ct:
+            inst = self._result_cache[self.__idx]
+            self.__idx += 1
+            return inst
+        
+        instance = self.iterate()
+        self._result_cache.append(instance)
+        self.__ct += 1
+        self.__idx += 1
+        return instance
 
 
 # create
@@ -608,6 +813,24 @@ class Q(object):
         return expr
 
 
+class F(object):
+    def __init__(self, field, model=None):
+        self.field = field
+        self.model = model
+        self.op = None
+        self.value = None
+
+    def __add__(self, rhs):
+        self.op = '+'
+        self.value = rhs
+        return self
+
+    def __sub__(self, rhs):
+        self.op = '-'
+        self.value = rhs
+        return self
+
+
 def apply_model(model, item):
     """
     Q() objects take a model, which provides context for the keyword arguments.
@@ -691,6 +914,9 @@ class BaseQuery(object):
     
     def clone(self):
         raise NotImplementedError
+
+    def qn(self, name):
+        return self.database.quote_name(name)
     
     def lookup_cast(self, lookup, value):
         return self.database.adapter.lookup_cast(lookup, value)
@@ -733,9 +959,19 @@ class BaseQuery(object):
                     raise ValueError('__is lookups only accept None')
                 operation = 'IS NULL'
                 lookup_value = []
+            elif op == 'isnull':
+                operation = 'IS NULL' if rhs else 'IS NOT NULL'
+                lookup_value = []
+            elif isinstance(rhs, F):
+                lookup_value = rhs
+                operation = self.operations[op] # leave as "%s"
+            elif isinstance(rhs, (list, tuple)):
+                lookup_value = [field.db_value(o) for o in rhs]
+                operation = self.operations[op] % \
+                    tuple(self.interpolation for v in lookup_value)
             else:
                 lookup_value = field.db_value(rhs)
-                operation = self.operations[op]
+                operation = self.operations[op] % self.interpolation
             
             parsed.append(
                 (field.name, (operation, self.lookup_cast(op, lookup_value)))
@@ -776,9 +1012,15 @@ class BaseQuery(object):
         return len(self._joined_models) > 0 or self.force_alias
 
     def combine_field(self, alias, field_name):
+        quoted = self.qn(field_name)
         if alias:
-            return '%s.%s' % (alias, field_name)
-        return field_name
+            return '%s.%s' % (alias, quoted)
+        return quoted
+
+    def safe_combine(self, model, alias, col):
+        if col in model._meta.fields:
+            return self.combine_field(alias, col)
+        return col
     
     def follow_joins(self, current, alias_map, alias_required, alias_count, seen=None):
         computed = []
@@ -815,7 +1057,7 @@ class BaseQuery(object):
             computed.append(
                 '%s JOIN %s AS %s ON %s = %s' % (
                     join_type,
-                    model._meta.db_table,
+                    self.qn(model._meta.db_table),
                     alias_map[model],
                     self.combine_field(alias_map[from_model], left_field),
                     self.combine_field(alias_map[model], right_field),
@@ -890,7 +1132,11 @@ class BaseQuery(object):
                 sql, value = self.convert_subquery(value)
                 operation = operation % sql
 
-            query_data.append(value)
+            if isinstance(value, F):
+                f_model = value.model or model
+                operation = operation % self.parse_f(value, f_model, alias_map)
+            else:
+                query_data.append(value)
             
             combined = self.combine_field(alias_map[model], name)
             query.append('%s %s' % (combined, operation))
@@ -904,17 +1150,38 @@ class BaseQuery(object):
             query = 'NOT %s' % query
         
         return query, query_data
+    
+    def parse_f(self, f_object, model, alias_map):
+        combined = self.combine_field(alias_map[model], f_object.field)
+        if f_object.op is not None:
+            combined = '(%s %s %s)' % (combined, f_object.op, f_object.value)
+
+        return combined
 
     def convert_subquery(self, subquery):
-        subquery.query, orig_query = subquery.model._meta.pk_name, subquery.query
+        orig_query = subquery.query
+        if subquery.query == '*':
+            subquery.query = subquery.model._meta.pk_name
+        
         subquery.force_alias, orig_alias = True, subquery.force_alias
         sql, data = subquery.sql()
         subquery.query = orig_query
         subquery.force_alias = orig_alias
         return sql, data
     
-    def raw_execute(self):
-        query, params = self.sql()
+    def sorted_models(self, alias_map):
+        return [
+            (model, alias) \
+                for (model, alias) in sorted(alias_map.items(), key=lambda i: i[1])
+        ]
+    
+    def sql(self):
+        raise NotImplementedError
+    
+    def execute(self):
+        raise NotImplementedError
+    
+    def raw_execute(self, query, params):
         return self.database.execute(query, params)
 
 
@@ -931,7 +1198,7 @@ class RawQuery(BaseQuery):
         return self._sql, self._params
     
     def execute(self):
-        return QueryResultWrapper(self.model, self.raw_execute())
+        return QueryResultWrapper(self.model, self.raw_execute(*self.sql()))
     
     def join(self):
         raise AttributeError('Raw queries do not support joining programmatically')
@@ -943,7 +1210,7 @@ class RawQuery(BaseQuery):
         raise AttributeError('Raw queries do not support switching contexts')
     
     def __iter__(self):
-        return self.execute()
+        return iter(self.execute())
 
 
 class SelectQuery(BaseQuery):
@@ -990,6 +1257,9 @@ class SelectQuery(BaseQuery):
         self._offset = num_rows
     
     def count(self):
+        if self._distinct:
+            return self.wrapped_count()
+        
         clone = self.order_by()
         clone._limit = clone._offset = None
         
@@ -1000,25 +1270,36 @@ class SelectQuery(BaseQuery):
         
         res = clone.database.execute(*clone.sql())
         
+        return (res.fetchone() or [0])[0]
+    
+    def wrapped_count(self):
+        clone = self.order_by()
+        clone._limit = clone._offset = None
+        
+        sql, params = clone.sql()
+        query = 'SELECT COUNT(1) FROM (%s) AS wrapped_select' % sql
+        
+        res = clone.database.execute(query, params)
+        
         return res.fetchone()[0]
     
     @returns_clone
-    def group_by(self, clause):
+    def group_by(self, *clauses):
         model = self.query_context
-        
-        if isinstance(clause, basestring):
-            fields = (clause,)
-        elif isinstance(clause, (list, tuple)):
-            fields = clause
-        elif issubclass(clause, Model):
-            model = clause
-            fields = clause._meta.get_field_names()
-        
-        self._group_by.append((model, fields))
+        for clause in clauses:
+            if isinstance(clause, basestring):
+                fields = (clause,)
+            elif isinstance(clause, (list, tuple)):
+                fields = clause
+            elif issubclass(clause, Model):
+                model = clause
+                fields = clause._meta.get_field_names()
+            
+            self._group_by.append((model, fields))
     
     @returns_clone
-    def having(self, clause):
-        self._having.append(clause)
+    def having(self, *clauses):
+        self._having = clauses
     
     @returns_clone
     def distinct(self):
@@ -1059,14 +1340,15 @@ class SelectQuery(BaseQuery):
         return bool(curs.fetchone())
     
     def get(self, *args, **kwargs):
+        orig_ctx = self.query_context
+        self.query_context = self.model
+        query = self.where(*args, **kwargs).paginate(1, 1)
         try:
-            orig_ctx = self.query_context
-            self.query_context = self.model
-            obj = self.where(*args, **kwargs).paginate(1, 1).execute().next()
+            obj = query.execute().next()
             return obj
         except StopIteration:
             raise self.model.DoesNotExist('instance matching query does not exist:\nSQL: %s\nPARAMS: %s' % (
-                self.sql()
+                query.sql()
             ))
         finally:
             self.query_context = orig_ctx
@@ -1078,57 +1360,86 @@ class SelectQuery(BaseQuery):
         return annotate_query(self, related_model, aggregation)
 
     def parse_select_query(self, alias_map):
-        if isinstance(self.query, (list, tuple)):
-            query = {self.model: self.query}
-        else:
-            query = self.query
+        q = self.query
         
-        if isinstance(query, basestring):
-            if query in ('*', self.model._meta.pk_name) and self.use_aliases():
-                return '%s.%s' % (alias_map[self.model], query)
-            return query
-        elif isinstance(query, dict):
-            qparts = []
-            aggregates = []
-            for model, cols in query.iteritems():
-                alias = alias_map.get(model, '')
-                for col in cols:
-                    if isinstance(col, tuple):
-                        if len(col) == 3:
-                            func, col, col_alias = col
-                            aggregates.append('%s(%s) AS %s' % \
-                                (func, self.combine_field(alias, col), col_alias)
-                            )
-                        elif len(col) == 2:
-                            col, col_alias = col
-                            qparts.append('%s AS %s' % \
-                                (self.combine_field(alias, col), col_alias)
-                            )
-                    else:
-                        qparts.append(self.combine_field(alias, col))
-            return ', '.join(qparts + aggregates)
-        else:
+        if isinstance(q, (list, tuple)):
+            q = {self.model: self.query}
+        elif isinstance(q, basestring):
+            # convert '*' and primary key lookups
+            if q == '*':
+                q = {self.model: self.model._meta.get_field_names()}
+            elif q == self.model._meta.pk_name:
+                q = {self.model: [self.model._meta.pk_name]}
+            else:
+                return q, []
+        
+        # by now we should have a dictionary if a valid type was passed in
+        if not isinstance(q, dict):
             raise TypeError('Unknown type encountered parsing select query')
+        
+        # gather aliases and models
+        sorted_models = self.sorted_models(alias_map)
+        
+        # normalize if we are working with a dictionary
+        columns = []
+        aggregates = []
+        model_cols = []
+        
+        for model, alias in sorted_models:
+            if model not in q:
+                continue
+            
+            if '*' in q[model]:
+                idx = q[model].index('*')
+                q[model] =  q[model][:idx] + model._meta.get_field_names() + q[model][idx+1:]
+            
+            for col in q[model]:
+                model_cols.append((model, col))
+                
+                if isinstance(col, tuple):
+                    if len(col) == 3:
+                        func, col, col_alias = col
+                        aggregates.append('%s(%s) AS %s' % \
+                            (func, self.safe_combine(model, alias, col), col_alias)
+                        )
+                    elif len(col) == 2:
+                        col, col_alias = col
+                        columns.append('%s AS %s' % \
+                            (self.safe_combine(model, alias, col), col_alias)
+                        )
+                else:
+                    columns.append(self.safe_combine(model, alias, col))
+        
+        return ', '.join(columns + aggregates), model_cols
+
     
-    def sql(self):
+    def sql_meta(self):
         joins, clauses, alias_map = self.compile_where()
         where, where_data = self.flatten_clauses(clauses)
         
-        table = self.model._meta.db_table
+        table = self.qn(self.model._meta.db_table)
 
         params = []
         group_by = []
+        use_aliases = self.use_aliases()
         
-        if self.use_aliases():
+        if use_aliases:
             table = '%s AS %s' % (table, alias_map[self.model])
-            for model, clause in self._group_by:
-                alias = alias_map[model]
-                for field in clause:
-                    group_by.append(self.combine_field(alias, field))
-        else:
-            group_by = [c[1] for c in self._group_by]
 
-        parsed_query = self.parse_select_query(alias_map)
+        for model, clause in self._group_by:
+            if use_aliases:
+                alias = alias_map[model]
+            else:
+                alias = ''
+
+            for field in clause:
+                group_by.append(self.combine_field(alias, field))
+
+        parsed_query, model_cols = self.parse_select_query(alias_map)
+        query_meta = {
+            'columns': model_cols,
+            'graph': self._joins,
+        }
         
         if self._distinct:
             sel = 'SELECT DISTINCT'
@@ -1144,8 +1455,10 @@ class SelectQuery(BaseQuery):
         order_by = []
         for piece in self._order_by:
             model, field, ordering = piece
-            if self.use_aliases() and field in model._meta.fields:
-                field = '%s.%s' % (alias_map[model], field)
+            if field in model._meta.fields:
+                field = self.qn(field)
+                if self.use_aliases():
+                    field = '%s.%s' % (alias_map[model], field)
             order_by.append('%s %s' % (field, ordering))
         
         pieces = [select]
@@ -1167,22 +1480,28 @@ class SelectQuery(BaseQuery):
         if self._offset:
             pieces.append('OFFSET %d' % self._offset)
         
-        return ' '.join(pieces), params
+        return ' '.join(pieces), params, query_meta
+    
+    def sql(self):
+        query, params, meta = self.sql_meta()
+        return query, params
     
     def execute(self):
         if self._dirty or not self._qr:
             try:
-                self._qr = QueryResultWrapper(self.model, self.raw_execute())
+                sql, params, meta = self.sql_meta()
+            except EmptyResultException:
+                return []
+            else:
+                self._qr = QueryResultWrapper(self.model, self.raw_execute(sql, params), meta)
                 self._dirty = False
                 return self._qr
-            except EmptyResultException:
-                return iter([])
         else:
             # call the __iter__ method directly
-            return iter(self._qr)
+            return self._qr
     
     def __iter__(self):
-        return self.execute()
+        return iter(self.execute())
 
 
 class UpdateQuery(BaseQuery):
@@ -1208,7 +1527,10 @@ class UpdateQuery(BaseQuery):
                 if field is None:
                     raise
             
-            sets[field.name] = field.db_value(v)
+            if not isinstance(v, F):
+                v = field.db_value(v)
+            
+            sets[field.name] = v
         
         return sets
     
@@ -1219,13 +1541,20 @@ class UpdateQuery(BaseQuery):
 
         params = []
         update_params = []
+        
+        alias = alias_map.get(self.model)
 
         for k, v in set_statement.iteritems():
-            params.append(v)
-            update_params.append('%s=%s' % (k, self.interpolation))
+            if isinstance(v, F):
+                value = self.parse_f(v, v.model or self.model, alias_map)
+            else:
+                params.append(v)
+                value = self.interpolation
+            
+            update_params.append('%s=%s' % (self.combine_field(alias, k), value))
         
         update = 'UPDATE %s SET %s' % (
-            self.model._meta.db_table, ', '.join(update_params))
+            self.qn(self.model._meta.db_table), ', '.join(update_params))
         where = ' AND '.join(where)
         
         pieces = [update]
@@ -1240,7 +1569,7 @@ class UpdateQuery(BaseQuery):
         raise AttributeError('Update queries do not support JOINs in sqlite')
     
     def execute(self):
-        result = self.raw_execute()
+        result = self.raw_execute(*self.sql())
         return self.database.rows_affected(result)
 
 
@@ -1259,7 +1588,7 @@ class DeleteQuery(BaseQuery):
 
         params = []
         
-        delete = 'DELETE FROM %s' % (self.model._meta.db_table)
+        delete = 'DELETE FROM %s' % (self.qn(self.model._meta.db_table))
         where = ' AND '.join(where)
         
         pieces = [delete]
@@ -1274,7 +1603,7 @@ class DeleteQuery(BaseQuery):
         raise AttributeError('Update queries do not support JOINs in sqlite')
     
     def execute(self):
-        result = self.raw_execute()
+        result = self.raw_execute(*self.sql())
         return self.database.rows_affected(result)
 
 
@@ -1288,7 +1617,7 @@ class InsertQuery(BaseQuery):
         vals = []
         for k, v in self.insert_query.iteritems():
             field = self.model._meta.get_field_by_name(k)
-            cols.append(k)
+            cols.append(self.qn(k))
             vals.append(field.db_value(v))
         
         return cols, vals
@@ -1297,7 +1626,7 @@ class InsertQuery(BaseQuery):
         cols, vals = self.parse_insert()
         
         insert = 'INSERT INTO %s (%s) VALUES (%s)' % (
-            self.model._meta.db_table,
+            self.qn(self.model._meta.db_table),
             ','.join(cols),
             ','.join(self.interpolation for v in vals)
         )
@@ -1311,7 +1640,7 @@ class InsertQuery(BaseQuery):
         raise AttributeError('Insert queries do not support JOINs')
     
     def execute(self):
-        result = self.raw_execute()
+        result = self.raw_execute(*self.sql())
         return self.database.last_insert_id(result, self.model)
 
 
@@ -1524,10 +1853,6 @@ class Field(object):
         self.attributes['column_type'] = col_type
         return self.field_template % self.attributes
     
-    def to_sql(self):
-        rendered = self.render_field_template()
-        return '%s %s' % (self.name, rendered)
-    
     def null_wrapper(self, value, default=None):
         if (self.null and value is None) or default is None:
             return value
@@ -1604,6 +1929,10 @@ class IntegerField(Field):
             return int(value)
 
 
+class BigIntegerField(IntegerField):
+    db_field = 'bigint'
+
+
 class BooleanField(IntegerField):
     db_field = 'boolean'
     
@@ -1623,6 +1952,10 @@ class FloatField(Field):
     def python_value(self, value):
         if value is not None:
             return float(value)
+
+
+class DoubleField(FloatField):
+    db_field = 'double'
 
 
 class DecimalField(Field):
@@ -1681,9 +2014,13 @@ class ForeignRelatedObject(object):
         return getattr(instance, self.cache_name, None)
     
     def __set__(self, instance, obj):
-        assert isinstance(obj, self.to), "Cannot assign %s, invalid type" % obj
-        setattr(instance, self.field_name, obj.get_pk())
-        setattr(instance, self.cache_name, obj)
+        if self.field.null and obj is None:
+            setattr(instance, self.field_name, None)
+            setattr(instance, self.cache_name, None)
+        else:
+            assert isinstance(obj, self.to), "Cannot assign %s, invalid type" % obj
+            setattr(instance, self.field_name, obj.get_pk())
+            setattr(instance, self.cache_name, obj)
 
 
 class ReverseForeignRelatedObject(object):
@@ -1730,7 +2067,7 @@ class ForeignKeyField(IntegerField):
         
         klass._meta.rel_fields[name] = self.name
         setattr(klass, self.descriptor, ForeignRelatedObject(self.to, self))
-        setattr(klass, self.name, None)
+        setattr(klass, self.name, FieldDescriptor(self))
         
         reverse_rel = ReverseForeignRelatedObject(klass, self.name)
         setattr(self.to, self.related_name, reverse_rel)
@@ -1848,6 +2185,11 @@ class BaseModel(type):
         if not hasattr(_meta, 'db_table'):
             _meta.db_table = re.sub('[^a-z]+', '_', cls.__name__.lower())
 
+        if _meta.db_table in _meta.database.adapter.reserved_tables:
+            warnings.warn('Table for %s ("%s") is reserved, please override using Meta.db_table' % (
+                cls, _meta.db_table,
+            ))
+
         setattr(cls, '_meta', _meta)
 
         _meta.pk_name = None
@@ -1926,7 +2268,7 @@ class Model(object):
             if isinstance(field_obj, PrimaryKeyField):
                 cls._meta.database.create_index(cls, field_obj.name, True)
             elif isinstance(field_obj, ForeignKeyField):
-                cls._meta.database.create_index(cls, field_obj.name, field_obj.unique)
+                cls._meta.database.create_foreign_key(cls, field_obj)
             elif field_obj.db_index or field_obj.unique:
                 cls._meta.database.create_index(cls, field_obj.name, field_obj.unique)
     
@@ -1982,6 +2324,10 @@ class Model(object):
     def get_pk(self):
         return getattr(self, self._meta.pk_name, None)
     
+    def set_pk(self, pk):
+        pk_field = self._meta.fields[self._meta.pk_name]
+        setattr(self, self._meta.pk_name, pk_field.python_value(pk))
+    
     def save(self):
         field_dict = self.get_field_dict()
         field_dict.pop(self._meta.pk_name)
@@ -1999,3 +2345,10 @@ class Model(object):
         return self.delete().where(**{
             self._meta.pk_name: self.get_pk()
         }).execute()
+    
+    def refresh(self, *fields):
+        fields = fields or self._meta.get_field_names()
+        obj = self.select(fields).get(**{self._meta.pk_name: self.get_pk()})
+        
+        for field_name in fields:
+            setattr(self, field_name, getattr(obj, field_name))

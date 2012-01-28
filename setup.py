@@ -7,7 +7,7 @@ f.close()
 
 setup(
     name='peewee',
-    version="0.7.4",
+    version="0.8.0",
     description='a little orm',
     long_description=readme,
     author='Charles Leifer',
@@ -22,5 +22,5 @@ setup(
         'Operating System :: OS Independent',
         'Programming Language :: Python',
     ],
-    test_suite='runtests.runtests'
+    test_suite='runtests.collect'
 )

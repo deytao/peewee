@@ -49,40 +49,40 @@ Field types table
 
 Parameters accepted by all field types and their default values:
 
-* ``null = False``
-* ``db_index = False``
-* ``unique = False``
-* ``verbose_name = None``
-* ``help_text = None``
+* ``null = False`` -- boolean indicating whether null values are allowed to be stored
+* ``db_index = False`` -- boolean indicating whether to create an index on this column
+* ``unique = False`` -- boolean indicating whether to create a unique index on this column
+* ``verbose_name = None`` -- string representing the "user-friendly" name of this field
+* ``help_text = None`` -- string representing any helpful text for this field
 
-+-------------------------------+--------------------------------+-------------------------------+
-| Field type                    | Underlying storage             | Special Parameters            |
-+===============================+================================+===============================+
-| :py:class:`CharField`         | ``varchar``                    | ``max_length``                |
-+-------------------------------+--------------------------------+-------------------------------+
-| :py:class:`TextField`         | * ``text``, sqlite, psql       | none                          |
-|                               | * ``longtext``, mysql          |                               |
-+-------------------------------+--------------------------------+-------------------------------+
-| :py:class:`DateTimeField`     | * ``datetime``, sqlite         | none                          |
-|                               | * ``datetime``, mysql          |                               |
-|                               | * ``timestamp``, psql          |                               |
-+-------------------------------+--------------------------------+-------------------------------+
-| :py:class:`IntegerField`      | ``integer``                    | none                          |
-+-------------------------------+--------------------------------+-------------------------------+
-| :py:class:`BooleanField`      | * ``smallint``, sqlite, psql   | none                          |
-|                               | * ``bool``, mysql              |                               |
-+-------------------------------+--------------------------------+-------------------------------+
-| :py:class:`FloatField`        | * ``real``, sqlite, psql       | none                          |
-|                               | * ``double precision``, mysql  |                               |
-+-------------------------------+--------------------------------+-------------------------------+
-| :py:class:`PrimaryKeyField`   | * ``integer``, sqlite          | none                          |
-|                               | * ``serial``, psql             |                               |
-|                               | * ``integer auto_increment``,  |                               |
-|                               |   mysql                        |                               |
-+-------------------------------+--------------------------------+-------------------------------+
-| :py:class:`ForeignKeyField`   | ``integer``                    | ``to``, ``related_name``,     |
-|                               |                                | ``cascade``, ``extra``        |
-+-------------------------------+--------------------------------+-------------------------------+
+
+===================   =================   =================   =================
+Field Type            Sqlite              Postgresql          MySQL
+===================   =================   =================   =================
+``CharField``         varchar             varchar             varchar
+``TextField``         text                text                longtext
+``DateTimeField``     datetime            timestamp           datetime
+``IntegerField``      integer             integer             integer
+``BooleanField``      smallint            boolean             bool
+``FloatField``        real                real                real
+``DoubleField``       real                double precision    double precision
+``BigIntegerField``   integer             bigint              bigint
+``DecimalField``      decimal             numeric             numeric
+``PrimaryKeyField``   integer             serial              integer
+``ForeignKeyField``   integer             integer             integer
+===================   =================   =================   =================
+
+
++-------------------------------+----------------------------------------------+
+| Field type                    | Special Parameters                           |
++===============================+==============================================+
+| :py:class:`CharField`         | ``max_length``                               |
++-------------------------------+----------------------------------------------+
+| :py:class:`DecimalField`      | ``max_digits``, ``places``                   |
++-------------------------------+----------------------------------------------+
+| :py:class:`ForeignKeyField`   | ``to``, ``related_name``,                    |
+|                               | ``cascade``, ``extra``                       |
++-------------------------------+----------------------------------------------+
 
 
 Self-referential Foreign Keys
@@ -129,6 +129,11 @@ Field class API
         :param lookup_type: a peewee lookup type, such as 'eq' or 'contains'
         :param value: a python data type
         :rtype: data type converted for use when querying
+    
+    .. py:method:: class_prepared()
+    
+        Simple hook for :py:class:`Field` classes to indicate when the :py:class:`Model`
+        class the field exists on has been created.
 
 .. py:class:: CharField
 
@@ -153,6 +158,10 @@ Field class API
 .. py:class:: FloatField
 
     Stores: floating-point numbers
+
+.. py:class:: DecimalField
+
+    Stores: decimal numbers
 
 .. py:class:: PrimaryKeyField
 
